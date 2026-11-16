@@ -144,12 +144,13 @@ def execute(manifest, cloud, now=None, sleep=time.sleep):
         if not servers:
             raise Failure("Bound server disappeared before cleanup")
         return "ARMED"
-    if servers:
-        try:
-            cloud.call("DELETE", f"/servers/{manifest['vm_id']}")
-        except HttpFailure as error:
-            if error.status != 404:
-                raise
+    # An empty project at the start cannot prove that this watchdog deleted the VM.
+    # The runner is ephemeral, so no earlier run's local state is trusted here.
+    if not servers:
+        raise Failure("Server absent before a verified delete request")
+    # A 404 or lost DELETE response is ambiguous. Fail and alert instead of
+    # reporting CLEANED without proof that this run's request was accepted.
+    cloud.call("DELETE", f"/servers/{manifest['vm_id']}")
     for _ in range(30):
         try:
             cloud.call("GET", f"/servers/{manifest['vm_id']}")
