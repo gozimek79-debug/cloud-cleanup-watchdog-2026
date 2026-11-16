@@ -73,6 +73,25 @@ class Tests(unittest.TestCase):
         self.assertEqual(cloud.deletions,
             [f"/servers/{SERVER_ID}", f"/primary_ips/{IP_ID}"])
 
+    def test_absent_before_delete_cannot_claim_cleaned(self):
+        cloud = FakeCloud(server=False, ip=False)
+        with self.assertRaisesRegex(watchdog.Failure, "absent before"):
+            watchdog.execute(manifest(), cloud,
+                now=watchdog.timestamp("2026-11-16T18:00:00Z"), sleep=lambda _: None)
+        self.assertEqual(cloud.deletions, [])
+
+    def test_delete_404_cannot_claim_cleaned(self):
+        class VanishedOnDelete(FakeCloud):
+            def call(self, method, path):
+                if method == "DELETE" and path == f"/servers/{SERVER_ID}":
+                    self.server = False
+                    raise watchdog.HttpFailure(404)
+                return super().call(method, path)
+        cloud = VanishedOnDelete()
+        with self.assertRaises(watchdog.HttpFailure):
+            watchdog.execute(manifest(), cloud,
+                now=watchdog.timestamp("2026-11-16T18:00:00Z"), sleep=lambda _: None)
+
     def test_other_billable_resource_fails_closed(self):
         cloud = FakeCloud(other=True)
         with self.assertRaisesRegex(watchdog.Failure, "Billable resource remains"):
