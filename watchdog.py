@@ -79,15 +79,19 @@ def items(cloud, collection):
     output = []
     page = 1
     while page <= 100:
-        response = cloud.call("GET", f"/{collection}?page={page}&per_page=50")
+        filter_types = "type=snapshot&type=backup&" if collection == "images" else ""
+        response = cloud.call("GET", f"/{collection}?{filter_types}page={page}&per_page=50")
         batch = response.get(collection)
         pagination = response.get("meta", {}).get("pagination", {})
-        if not isinstance(batch, list) or not isinstance(pagination.get("last_page"), int):
+        next_page = pagination.get("next_page")
+        if (not isinstance(batch, list) or pagination.get("page") != page or
+                "next_page" not in pagination or
+                (next_page is not None and (type(next_page) is not int or next_page != page + 1))):
             raise Failure("Incomplete API inventory")
         output.extend(batch)
-        if page >= pagination["last_page"]:
+        if next_page is None:
             return output
-        page += 1
+        page = next_page
     raise Failure("Inventory too large")
 
 
@@ -136,20 +140,28 @@ def execute(manifest, cloud, now=None, sleep=time.sleep):
     if servers:
         server = servers[0]
         ipv4 = (server.get("public_net") or {}).get("ipv4") or {}
+        ipv6 = (server.get("public_net") or {}).get("ipv6")
         if (server.get("name") != manifest["vm_name"] or
                 timestamp(server["created"]) != created or
                 ipv4.get("id") != manifest["primary_ipv4_id"]):
             raise Failure("Server binding differs from API")
+        # This experiment provisions IPv4 only. An unbound IPv6 requires review
+        # before any deletion, since its identity is not in the signed manifest.
+        if ipv6:
+            raise Failure("Unexpected server IPv6")
     if now < cleanup_at:
         if not servers:
             raise Failure("Bound server disappeared before cleanup")
         return "ARMED"
-    if servers:
-        try:
-            cloud.call("DELETE", f"/servers/{manifest['vm_id']}")
-        except HttpFailure as error:
-            if error.status != 404:
-                raise
+    # An empty project at the start cannot prove that this watchdog deleted the VM.
+    # The runner is ephemeral, so no earlier run's local state is trusted here.
+    if not servers:
+        if billable(cloud):
+            raise Failure("Server absent with billable resources")
+        return "ABSENT_NO_BILLING"  # Never claim that this run performed cleanup.
+    # A 404 or lost DELETE response is ambiguous. Fail and alert instead of
+    # reporting CLEANED without proof that this run's request was accepted.
+    cloud.call("DELETE", f"/servers/{manifest['vm_id']}")
     for _ in range(30):
         try:
             cloud.call("GET", f"/servers/{manifest['vm_id']}")
@@ -165,15 +177,11 @@ def execute(manifest, cloud, now=None, sleep=time.sleep):
         remaining = billable(cloud)
         ip_list = remaining.get("primary_ips", [])
         if not remaining:
-            return "CLEANED"
+            return "LATE_CLEANED" if now >= deadline else "CLEANED"
         if set(remaining) == {"primary_ips"} and len(ip_list) == 1:
             ip = ip_list[0]
             if ip.get("id") == manifest["primary_ipv4_id"] and ip.get("assignee_id") is None:
-                try:
-                    cloud.call("DELETE", f"/primary_ips/{ip['id']}")
-                except HttpFailure as error:
-                    if error.status != 404:
-                        raise
+                cloud.call("DELETE", f"/primary_ips/{ip['id']}")
         sleep(10)
     raise Failure("Billable resource remains")
 
@@ -181,7 +189,7 @@ def execute(manifest, cloud, now=None, sleep=time.sleep):
 def main():
     try:
         token = os.environ.get("HCLOUD_TOKEN", "")
-        if len(token) < 20 or not token.isascii():
+        if len(token) < 20 or not token.isascii() or not token.isprintable():
             raise Failure("Project token missing")
         cloud = Cloud(token)
         raw = os.environ.get("TARGET_MANIFEST", "")
@@ -190,7 +198,7 @@ def main():
         else:
             result = execute(json.loads(raw), cloud)
         print(result)  # Public CI output contains no IDs, IPs, or secrets.
-        return 0
+        return 2 if result == "LATE_CLEANED" else 0
     except Exception as error:
         print("WATCHDOG_FAIL " + type(error).__name__, file=sys.stderr)
         return 2
